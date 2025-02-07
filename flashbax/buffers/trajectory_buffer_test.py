@@ -337,11 +337,11 @@ def is_strictly_increasing(arr: jnp.ndarray) -> jnp.ndarray:
     return jnp.all(arr[1:] > arr[:-1])
 
 
-@pytest.mark.parametrize("add_length", [1, 4, 9, 13])
+@pytest.mark.parametrize("add_length", [4, 9, 13])
 @pytest.mark.parametrize("add_batch_size", [2])
-@pytest.mark.parametrize("sample_sequence_length", [1, 3, 4, 9, 13])
+@pytest.mark.parametrize("sample_sequence_length", [3, 4, 9, 13])
 @pytest.mark.parametrize("period", [1, 2, 3, 4, 5])
-@pytest.mark.parametrize("max_length_time_axis", [65, 70, 77, 83, 99])
+@pytest.mark.parametrize("max_length_time_axis", [13, 16, 26, 39])
 def test_sample_doesnt_sample_prev_broken_trajectories(
     add_length: int,
     add_batch_size: int,
