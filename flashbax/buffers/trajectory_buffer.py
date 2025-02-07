@@ -21,7 +21,7 @@ This allows for random sampling of the trajectories within the buffer.
 
 import functools
 import warnings
-from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Callable, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:  # https://github.com/python/mypy/issues/6239
     from dataclasses import dataclass
@@ -65,8 +65,6 @@ class TrajectoryBufferSample(Generic[Experience]):
 
     experience: Experience
 
-def get_max_divisible_length(max_length_time_axis, period):
-    return max_length_time_axis - (max_length_time_axis % period)
 
 def init(
     experience: Experience,
@@ -159,55 +157,12 @@ def add(
         is_full=new_is_full,
     )
 
-def _get_starting_point(breaking_point, period):
-    starting_point = (breaking_point + period - 1) // period * period
-    return starting_point 
 
-def _get_num_valid_items_if_full(current_index, sample_sequence_length, period, max_length_time_axis):
-    starting_point = _get_starting_point(current_index, period)
-    valid_buffer_size = (max_length_time_axis - starting_point + current_index) 
-    num_valid_items_if_full = (valid_buffer_size - sample_sequence_length) // period + 1
-    starting_point %= max_length_time_axis
-    
-    return num_valid_items_if_full, starting_point
-
-def _get_num_valid_items_if_not_full(current_index, sample_sequence_length, period):
-    max_start = current_index - sample_sequence_length
-    num_valid_items_if_not_full = jnp.where(max_start >= 0, (max_start // period) + 1, 0)
-    starting_point = 0
-    
-    return num_valid_items_if_not_full, starting_point
-
-def _get_sampling_indices(current_index: int, max_length_time_axis: int, sample_sequence_length:int, period:int, batch_size :int, rng_key : chex.PRNGKey, add_batch_size : int, buffer_is_full: bool) -> Tuple[Array, Array]:
-    
-    # Calculate branched logic for full and not full
-    num_valid_items_if_full, starting_point_if_full = _get_num_valid_items_if_full(current_index, sample_sequence_length, period, max_length_time_axis)
-    num_valid_items_if_not_full, starting_point_if_not_full = _get_num_valid_items_if_not_full(current_index, sample_sequence_length, period)
-    
-    # Choose correct values depending on full status
-    num_valid_items = jnp.where(buffer_is_full, num_valid_items_if_full, num_valid_items_if_not_full)
-    starting_point = jnp.where(buffer_is_full, starting_point_if_full, starting_point_if_not_full)
-    
-    # Sample the 'item' indices for these subsequences
-    subkey_items, subkey_batch = jax.random.split(rng_key)
-    sampled_item_idx = jax.random.randint(
-        subkey_items, (batch_size,), 0, num_valid_items
-    )
-    
-    # Calculate the actual data time indices for these subsequences  
-    data_time_indices = (starting_point + sampled_item_idx*period) % max_length_time_axis
-    # Sample the 'batch' indices for these subsequences  
-    data_batch_indices = jax.random.randint(
-        subkey_batch, (batch_size,), 0, add_batch_size
-    )
-    
-    return data_time_indices, data_batch_indices
-    
 def sample(
     state: TrajectoryBufferState[Experience],
     rng_key: chex.PRNGKey,
     batch_size: int,
-    sample_sequence_length: int,
+    sequence_length: int,
     period: int,
 ) -> TrajectoryBufferSample[Experience]:
     """
@@ -217,7 +172,7 @@ def sample(
         state: The buffer's state.
         rng_key: Random key.
         batch_size: Batch size of sampled experience.
-        sample_sequence_length: Length of trajectory to sample.
+        sequence_length: Length of trajectory to sample.
         period: The period refers to the interval between sampled sequences. It serves to regulate
             how much overlap there is between the trajectories that are sampled. To understand the
             degree of overlap, you can calculate it as the difference between the
@@ -237,17 +192,43 @@ def sample(
         state.experience, n_axes=2
     )
 
-    # Perform the sampling
-    data_start_time_idx, data_batch_idx = _get_sampling_indices(state.current_index, max_length_time_axis, sample_sequence_length, period, batch_size, rng_key, add_batch_size, state.is_full)
-    
+    # When full, the max time index is max_length_time_axis otherwise it is current index.
+    max_time = jnp.where(state.is_full, max_length_time_axis, state.current_index)
+    # When full, the oldest valid data is current_index otherwise it is zero.
+    head = jnp.where(state.is_full, state.current_index, 0)
+
+    # Given no wrap around, the last valid starting index is:
+    max_start = max_time - sequence_length
+    # If max_start is negative then we cannot sample yet.
+    # Otherwise the number of valid items in the buffer are (max_start // period) + 1.
+    num_valid_items = jnp.where(max_start >= 0, (max_start // period) + 1, 0)
+    # (num_valid_items is the number of candidate subsequences—each starting at a
+    # multiple of period that lie entirely in the valid region.)
+
+    # Split the RNG key for sampling items and batch indices.
+    rng_key, subkey_items = jax.random.split(rng_key)
+    rng_key, subkey_batch = jax.random.split(rng_key)
+
+    # Sample an item index in [0, num_valid_items). (This is the index in the candidate list.)
+    sampled_item_idx = jax.random.randint(
+        subkey_items, (batch_size,), 0, num_valid_items
+    )
+    # Compute the logical start time index: ls = (sampled_item_idx * period).
+    logical_start = sampled_item_idx * period
+    # Map logical time to physical index in the buffer given there is wrap around.
+    physical_start = (head + logical_start) % max_length_time_axis
+
+    # Also sample which add_batch row to use.
+    sampled_batch_indices = jax.random.randint(
+        subkey_batch, (batch_size,), 0, add_batch_size
+    )
     # Create indices for the full subsequence.
-    data_time_idx = (
-        data_start_time_idx[:, None] + jnp.arange(sample_sequence_length)
+    traj_time_indices = (
+        physical_start[:, None] + jnp.arange(sequence_length)
     ) % max_length_time_axis
 
-    # Slice the buffer
     batch_trajectory = jax.tree.map(
-        lambda x: x[data_batch_idx[:, None], data_time_idx],
+        lambda x: x[sampled_batch_indices[:, None], traj_time_indices],
         state.experience,
     )
 
@@ -408,13 +389,6 @@ def make_trajectory_buffer(
     Returns:
         A trajectory buffer.
     """
-    prev_max_length_time_axis = max_length_time_axis
-    max_length_time_axis = get_max_divisible_length(max_length_time_axis, period)
-    
-    print(f"Setting max_length_time_axis to {max_length_time_axis} to make divisible by period argument")
-    print(f"This results in a total reduction in capacity of {prev_max_length_time_axis*add_batch_size - max_length_time_axis*add_batch_size}")
-    
-    
     validate_trajectory_buffer_args(
         max_length_time_axis=max_length_time_axis,
         min_length_time_axis=min_length_time_axis,
@@ -442,7 +416,7 @@ def make_trajectory_buffer(
     sample_fn = functools.partial(
         sample,
         batch_size=sample_batch_size,
-        sample_sequence_length=sample_sequence_length,
+        sequence_length=sample_sequence_length,
         period=period,
     )
     can_sample_fn = functools.partial(
