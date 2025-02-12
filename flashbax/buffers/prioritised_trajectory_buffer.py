@@ -25,6 +25,10 @@ import functools
 import warnings
 from typing import TYPE_CHECKING, Callable, Generic, Optional, Tuple
 
+import numpy as np
+
+from flashbax.buffers.utils import print_pretty_tree
+
 if TYPE_CHECKING:  # https://github.com/python/mypy/issues/6239
     from dataclasses import dataclass
 else:
@@ -62,6 +66,7 @@ SET_BATCH_FN = {
     "cpu": sum_tree.set_batch_scan,
 }
 
+# TODO: fix the add_batch_size item calc
 
 @dataclass(frozen=True)
 class PrioritisedTrajectoryBufferState(TrajectoryBufferState, Generic[Experience]):
@@ -69,9 +74,12 @@ class PrioritisedTrajectoryBufferState(TrajectoryBufferState, Generic[Experience
 
     sum_tree_state: `SumTree`  storing the priorities of the buffer, used for prioritised sampling
         of the indices corresponding to different subsequences.
+    running_index: Array - like current_index, it keeps track of where we are in the buffer
+        however it is never modulo'ed. This is required for calculating newly valid and invalid items. 
     """
 
     sum_tree_state: SumTreeState
+    running_index : Array
 
 
 @dataclass(frozen=True)
@@ -90,10 +98,8 @@ class PrioritisedTrajectoryBufferSample(TrajectoryBufferSample, Generic[Experien
 
 
 def get_max_divisible_length(max_length_time_axis, period):
+    """Get the maximim length that is divisible by period."""
     return max_length_time_axis - (max_length_time_axis % period)
-
-def get_max_num_possible_items(max_length_time_axis, sample_sequence_length, period):
-    return (max_length_time_axis - sample_sequence_length) // period + 1
 
 def get_sum_tree_capacity(
     max_length_time_axis: int, period: int, add_batch_size: int
@@ -101,6 +107,9 @@ def get_sum_tree_capacity(
     """Get the capacity of the sum tree."""
     return int((max_length_time_axis // period) * add_batch_size)
 
+def get_sum_tree_num_nodes(sum_tree_state : SumTreeState) -> Array:
+    """Get the number of nodes in the sum tree. """
+    return sum_tree_state.nodes.size
 
 def prioritised_init(
     experience: Experience,
@@ -137,88 +146,95 @@ def prioritised_init(
 
     # The size of the sum tree is the number of possible items
     # based on the period and row length. This is multiplied by the
-    # number of rows. If the buffer is not using prioritised sampling
-    # then the size is 0.
+    # number of rows.
     sum_tree_size = get_sum_tree_capacity(max_length_time_axis, period, add_batch_size)
     sum_tree_state = sum_tree.init(sum_tree_size)
+    
+    # Set the running index
+    running_index = jnp.array(0, dtype=jnp.int32)
 
-    return PrioritisedTrajectoryBufferState(sum_tree_state=sum_tree_state, **state)  # type: ignore
+    return PrioritisedTrajectoryBufferState(sum_tree_state=sum_tree_state, running_index=running_index, **state)  # type: ignore
 
-def _get_starting_point(breaking_point, period):
+def _get_starting_point(breaking_point, period, max_length_time_axis):
+    breaking_point -= max_length_time_axis
+    breaking_point = jnp.maximum(breaking_point, 0)
     starting_point = (breaking_point + period - 1) // period * period
-    return starting_point 
+    return starting_point
 
-def _get_valid_item_indices(index_after_writing, max_length_time_axis: int, sample_sequence_length:int, period:int):
-    starting_point = _get_starting_point(index_after_writing, period)
-    
-    valid_buffer_size = (max_length_time_axis - starting_point + index_after_writing) 
+def _get_valid_buffer_size(starting_point, breaking_point):
+    return (breaking_point-starting_point) 
+
+def _get_num_valid_items_in_buffer(starting_point, breaking_point, sample_sequence_length, period):
+    valid_buffer_size = _get_valid_buffer_size(starting_point, breaking_point)
     num_valid_items = (valid_buffer_size - sample_sequence_length) // period + 1
-    
-    starting_point %= max_length_time_axis
-    data_indices = (starting_point + jnp.arange(num_valid_items)*period) % max_length_time_axis
-    # jnp.arange(starting_point, starting_point + num_valid_items, period) % ...
-        
-    max_num_possible_items = get_max_num_possible_items(max_length_time_axis, sample_sequence_length, period)
-    
-    item_indices = jnp.arange(max_num_possible_items).at[:num_valid_items].set(data_indices//period)
-    item_indices = item_indices.at[num_valid_items:].set(-1)
+    return num_valid_items
 
-    return item_indices
+def _get_padding_num(max_length_time_axis, period, add_batch_size):
+    return get_sum_tree_capacity(max_length_time_axis, period, add_batch_size)+1
 
-def _get_newly_valid_item_indices(index_before_writing, index_after_writing, period):
+def _calculate_new_item_indices(
+    index_before_writing: int,
+    add_sequence_length: int,
+    period: int,
+    max_length_time_axis: int,
+    sample_sequence_length: int,
+    add_batch_size: int
+) -> jnp.ndarray:
+    """
+    Returns an array containing item-indices whose sub-sequence has JUST become valid
+    after appending 'add_sequence_length' steps in a full buffer. If a previously valid item is still valid
+    but its entire subsequence has been overwritten, it is regarded as a new valid item.
+    """
     
-    starting_point_after_writing = _get_starting_point(index_after_writing, period)
-    
-    starting_point_before_writing = _get_starting_point(index_before_writing, period)
-    
-    # print("SP A, SP B", starting_point_after_writing, starting_point_before_writing)
-    # print("VALID DATA RANGE:", jnp.arange(starting_point_after_writing, starting_point_before_writing, step=period))
-    print("NEWLY VALID ITEM RANGE:", jnp.arange(starting_point_after_writing, starting_point_before_writing, step=period)//period)
+    # Calculate the valid buffer range before adding: (starting_point_1, ending_point_1)
+    starting_point_1 = _get_starting_point(index_before_writing, period, max_length_time_axis)
+    breaking_point_1 = index_before_writing
+    num_valid_items_1 = _get_num_valid_items_in_buffer(starting_point_1, breaking_point_1, sample_sequence_length, period)
+    ending_point_1 = starting_point_1+num_valid_items_1*period
 
-def _get_newly_invalid_item_indices(index_before_writing, index_after_writing, period, max_length_time_axis, sample_sequence_length):
-    
-    starting_point_after_writing = _get_starting_point(index_after_writing, period)
-    starting_point_before_writing = _get_starting_point(index_before_writing, period)
-    
-    valid_buffer_size_after = (max_length_time_axis - starting_point_after_writing + index_after_writing)
-    valid_buffer_size_before = (max_length_time_axis - starting_point_before_writing + index_before_writing)
-    
-    num_valid_items_after = (valid_buffer_size_after - sample_sequence_length) // period + 1
-    num_valid_items_before = (valid_buffer_size_before - sample_sequence_length) // period + 1
-    
-    starting_point_after_writing %= max_length_time_axis
-    starting_point_before_writing %= max_length_time_axis
-    
-    ending_point_after_writing = starting_point_after_writing + num_valid_items_after*period
-    ending_point_before_writing = starting_point_before_writing + num_valid_items_before*period
-    
-    print("EP A, EP B", ending_point_after_writing, ending_point_before_writing)
-    print("INVALID DATA RANGE:", jnp.arange(ending_point_after_writing, ending_point_before_writing, step=period))
-    print("INVALID ITEM RANGE:", jnp.arange(ending_point_after_writing, ending_point_before_writing, step=period)//period)
+    # Calculate the valid buffer range after adding: (starting_point_2, ending_point_2)
+    index_after_writing = (index_before_writing + add_sequence_length)
+    starting_point_2 = _get_starting_point(index_after_writing, period, max_length_time_axis)
+    breaking_point_2 = index_after_writing
+    num_valid_items_2 = _get_num_valid_items_in_buffer(starting_point_2, breaking_point_2, sample_sequence_length, period)
+    ending_point_2 = starting_point_2+num_valid_items_2*period
 
-def _get_tree_idxs_probs_given_full(state: PrioritisedTrajectoryBufferState, max_length_time_axis: int, sample_sequence_length:int, add_sequence_length:int, period:int):
-    new_unrolled_index = (state.current_index + add_sequence_length) % max_length_time_axis
+    # Calculate the range of newly valid+fully overwritten indices
+    range_to_add = (jnp.maximum(starting_point_2, ending_point_1), ending_point_2)
+    # Calculate the range of newly invalid indices i.e. broken item subsequences
+    range_to_remove = (starting_point_1, jnp.minimum(starting_point_2, ending_point_1))
     
-    valid_indices = _get_valid_item_indices(new_unrolled_index, max_length_time_axis, sample_sequence_length, period)
-    priorities = jnp.where(valid_indices!=-1, jnp.ones_like(valid_indices)*state.sum_tree_state.max_recorded_priority, jnp.zeros_like(valid_indices))
+    # Convert data indices to item indices
+    newly_valid_item_indices = (jnp.arange(range_to_add[0], range_to_add[1], step=period)%max_length_time_axis)//period
+    newly_invalid_item_indices = (jnp.arange(range_to_remove[0], range_to_remove[1], step=period)%max_length_time_axis)//period
     
-    return valid_indices, priorities
+    # JAX static padding
+    fill_number = _get_padding_num(max_length_time_axis, period, add_batch_size)
+    max_possible_created_items = (add_sequence_length//period) + 1
+    # padding = jnp.full(max_possible_created_items, fill_value=fill_number, dtype=jnp.int32)
+    diff_valid = max_possible_created_items - newly_valid_item_indices.size
+    diff_invalid = max_possible_created_items - newly_invalid_item_indices.size
+   
+    newly_valid_item_indices = jnp.pad(newly_valid_item_indices, (0, diff_valid), constant_values=fill_number)
+    newly_invalid_item_indices = jnp.pad(newly_invalid_item_indices, (0, diff_invalid), constant_values=fill_number)
     
-def _get_tree_idxs_probs_given_not_full(state: PrioritisedTrajectoryBufferState, max_length_time_axis: int, sample_sequence_length:int, add_sequence_length:int, period:int):
-    new_unrolled_index = (state.current_index + add_sequence_length)
-    max_time = new_unrolled_index
+    return newly_valid_item_indices, newly_invalid_item_indices
 
-    max_start = max_time - sample_sequence_length
-    num_valid_items = jnp.where(max_start >= 0, (max_start // period) + 1, 0)
+def _calculate_new_item_priorities(sum_tree_state : SumTreeState,newly_valid_item_indices: Array, newly_invalid_item_indices: Array, max_length_time_axis, period, add_batch_size) -> Tuple[Array, Array]:
     
-    max_num_possible_items = get_max_num_possible_items(max_length_time_axis, sample_sequence_length, period)
+    # Get the padding value
+    padding_value = _get_padding_num(max_length_time_axis, period, add_batch_size)
+    # Calculate the masked valid priorities
+    new_valid_priorities =  jnp.full_like(newly_valid_item_indices, fill_value=sum_tree_state.max_recorded_priority)
+    vp_mask = newly_valid_item_indices != padding_value
+    new_valid_priorities = new_valid_priorities*vp_mask
     
-    indices = jnp.arange(max_num_possible_items)
-    indices = indices.at[num_valid_items:].set(-1)
-    priorities = jnp.where(indices!=-1, jnp.ones_like(indices)*state.sum_tree_state.max_recorded_priority, jnp.zeros_like(indices))
+    # Get invalid priorities
+    new_invalid_priorities =  jnp.zeros_like(newly_invalid_item_indices)
     
-    return indices, priorities
-
+    print("PRIORITIES",new_valid_priorities, new_invalid_priorities)
+    
+    return new_valid_priorities, new_invalid_priorities
 
 def prioritised_add(
     state: PrioritisedTrajectoryBufferState[Experience],
@@ -269,37 +285,6 @@ def prioritised_add(
 
     # Calculate index location in the state where we will assign the batch of experience.
     data_indices = (jnp.arange(add_sequence_length) + state.current_index) % max_length_time_axis
-
-    # Update the priority storage.
-    print("========")
-    idxs_full, prios_full = _get_tree_idxs_probs_given_full(state, max_length_time_axis, sample_sequence_length, add_sequence_length, period)
-    idxs_not_full, prios_not_full = _get_tree_idxs_probs_given_not_full(state, max_length_time_axis, sample_sequence_length, add_sequence_length, period)
-    
-    # sum_tree_indices = jnp.where(state.is_full | state.current_index+add_sequence_length>=max_length_time_axis, idxs_full, idxs_not_full)
-    # sum_tree_priorities = jnp.where(state.is_full | state.current_index+add_sequence_length>=max_length_time_axis, prios_full, prios_not_full )
-    
-    # TEMP FOR DEBUGGING:
-    if state.is_full or state.current_index+add_sequence_length>=max_length_time_axis:
-        sum_tree_indices = idxs_full
-        sum_tree_priorities = prios_full
-        _get_newly_valid_item_indices(state.current_index, (state.current_index + add_sequence_length) % max_length_time_axis, period)
-        # _get_newly_invalid_item_indices(state.current_index, (state.current_index + add_sequence_length) % max_length_time_axis, period, max_length_time_axis, sample_sequence_length)
-    else:
-        sum_tree_indices = idxs_not_full
-        sum_tree_priorities = prios_not_full
-    
-    print("IS FULL:", state.is_full or state.current_index+add_sequence_length>=max_length_time_axis)
-    print("VALID INDICES:", sum_tree_indices, sum_tree_priorities)
-    
-    print("========")
-
-    # Update the sum tree.
-    # sum_tree_state = SET_BATCH_FN[device](
-    #     state.sum_tree_state,
-    #     priority_indices,
-    #     unnormalised_priorities,
-    # )
-    
     
     # Update the buffer state.
     new_experience = jax.tree.map(
@@ -308,7 +293,28 @@ def prioritised_add(
         batch,
     )
 
+    # Calculate which items have become valid/fully overwritten and invalid
+    valid_items, invalid_items = _calculate_new_item_indices(state.running_index, add_sequence_length, period, max_length_time_axis, sample_sequence_length, add_batch_size)
+    valid_priorities, invalid_priorities = _calculate_new_item_priorities(state.sum_tree_state, valid_items, invalid_items, max_length_time_axis, period, add_batch_size)
+    
+    # Update the sum tree.
+    # Importantly, we have to update the invalid items first and then the valid items
+    # First the invalid
+    new_sum_tree_state = SET_BATCH_FN[device](
+        state.sum_tree_state,
+        invalid_items,
+        invalid_priorities,
+    )
+    # then the valid
+    new_sum_tree_state = SET_BATCH_FN[device](
+        new_sum_tree_state,
+        valid_items,
+        valid_priorities,
+    )
+    
+    # Update buffer pointers and flags
     new_current_index = state.current_index + add_sequence_length
+    new_running_index = state.running_index + add_sequence_length
     new_is_full = state.is_full | (new_current_index >= max_length_time_axis)
     new_current_index = new_current_index % max_length_time_axis
 
@@ -316,9 +322,27 @@ def prioritised_add(
         experience=new_experience,
         current_index=new_current_index,
         is_full=new_is_full,
-        # sum_tree_state=sum_tree_state,
+        running_index=new_running_index,
+        sum_tree_state=new_sum_tree_state
     )
 
+def _handle_zero_priority_items(state : PrioritisedTrajectoryBufferState, item_indices : Array):
+    
+    # There is an edge case where experience from the sum-tree has probability 0.
+    # This should not be happening frequently.
+    # To deal with this we overwrite indices with probability zero with
+    # the index that is the most probable within the batch of indices. This slightly biases
+    # the sampling, however as this is an edge case it is unlikely to have a significant effect.
+    priorities = sum_tree.get(state.sum_tree_state, item_indices)
+    most_probable_in_batch_index = jnp.argmax(priorities)
+    item_indices = jnp.where(
+        priorities == 0, item_indices[most_probable_in_batch_index], item_indices
+    )
+    priorities = jnp.where(
+        priorities == 0, priorities[most_probable_in_batch_index], priorities
+    )
+    
+    return item_indices, priorities
 
 def prioritised_sample(
     state: PrioritisedTrajectoryBufferState[Experience],
@@ -352,42 +376,13 @@ def prioritised_sample(
         state.experience, n_axes=2
     )
 
-    # Sample items from the priority array.
+    # Sample items from the sum tree.
     item_indices = sum_tree.stratified_sample(state.sum_tree_state, batch_size, rng_key)
 
+    item_indices, priorities = _handle_zero_priority_items(state, item_indices)
+    
     trajectory = _get_sample_trajectories(
         item_indices, max_length_time_axis, period, sequence_length, state
-    )
-
-    # There is an edge case where experience from the sum-tree has probability 0.
-    # To deal with this we overwrite indices with probability zero with
-    # the index that is the most probable within the batch of indices. This slightly biases
-    # the sampling, however as this is an edge case it is unlikely to have a significant effect.
-    priorities = sum_tree.get(state.sum_tree_state, item_indices)
-    most_probable_in_batch_index = jnp.argmax(priorities)
-    item_indices = jnp.where(
-        priorities == 0, item_indices[most_probable_in_batch_index], item_indices
-    )
-    priorities = jnp.where(
-        priorities == 0, priorities[most_probable_in_batch_index], priorities
-    )
-
-    # We get the indices of the items that will be invalid when sampling from the buffer state.
-    # If the sampled indices are in the invalid indices, then we replace them with the
-    # most probable index in the batch. As with above this is unlikely to occur.
-    invalid_item_indices = get_invalid_indices(
-        state, sequence_length, period, add_batch_size, max_length_time_axis
-    )
-    invalid_item_indices = invalid_item_indices.flatten()
-    item_indices = jnp.where(
-        jnp.any(item_indices[:, None] == invalid_item_indices, axis=-1),
-        item_indices[most_probable_in_batch_index],
-        item_indices,
-    )
-    priorities = jnp.where(
-        jnp.any(item_indices[:, None] == invalid_item_indices, axis=-1),
-        priorities[most_probable_in_batch_index],
-        priorities,
     )
 
     return PrioritisedTrajectoryBufferSample(
@@ -693,10 +688,16 @@ def test_prioritised_sample_doesnt_sample_prev_broken_trajectories(
     sample_sequence_length: int,
     period: int,
     max_length_time_axis: int,
+    correct_valid_item_indices: dict,
+    correct_invalid_item_indices: dict
 ) -> None:
     """Test to ensure that `sample` avoids including rewards from broken
     trajectories.
     """
+    print("ADD LENGTH:", add_length)
+    print("SAMPLE SEQUENCE LENGTH:", sample_sequence_length)
+    print("PERIOD:", period)
+    print("MAX LENGTH TIME AXIS:", max_length_time_axis)
     fake_transition = {"reward": jnp.array([1])}
 
     offset = jnp.arange(add_batch_size).reshape(add_batch_size, 1, 1) * 1000
@@ -710,17 +711,14 @@ def test_prioritised_sample_doesnt_sample_prev_broken_trajectories(
         min_length_time_axis=sample_sequence_length,
     )
     buffer_init = jax.jit(buffer.init)
-    # buffer_add = jax.jit(buffer.add)
-    buffer_sample = jax.jit(buffer.sample)
-    # buffer_init = buffer.init
     buffer_add = buffer.add
-    # buffer_sample = buffer.sample
+
 
     rng_key = jax.random.PRNGKey(0)
     state = buffer_init(fake_transition)
 
     for i in range(5):
-        print(f"ITERATION {i}")
+        print(f"ITERATION {i+1}")
         fake_batch_sequence = {
             "reward": jnp.arange(add_length)
             .reshape(1, add_length, 1)
@@ -728,22 +726,78 @@ def test_prioritised_sample_doesnt_sample_prev_broken_trajectories(
             + offset
             + add_length * i
         }
+        
+        valid_items, invalid_items = _calculate_new_item_indices(state.running_index, add_length, period, max_length_time_axis, sample_sequence_length, add_batch_size)
+        for j, idx in enumerate(correct_valid_item_indices[i]):
+            assert idx == valid_items[j], "Incorrectly calculated valid item"
+            
+        for j, idx in enumerate(correct_invalid_item_indices[i]):
+            assert idx == invalid_items[j], f"Incorrectly calculated invalid item, {idx} vs {invalid_items[j]}"
+            
         state = buffer_add(state, fake_batch_sequence)
-
+        print("====================================")
+        print("AFTER ADDING: ",valid_items[valid_items<_get_padding_num(max_length_time_axis, period, add_batch_size)])
+        print("AND REMOVING:", invalid_items[invalid_items<_get_padding_num(max_length_time_axis, period, add_batch_size)])
+        print_pretty_tree(np.asarray(state.sum_tree_state.nodes))
+        print(np.asarray(state.sum_tree_state.nodes))
+        print("====================================")
         rng_key, rng_key1 = jax.random.split(rng_key)
 
-        # if buffer.can_sample(state):
-        #     sample = buffer_sample(state, rng_key1)
+       
 
-        #     sampled_r = sample.experience["reward"]
 
-        #     for b in range(sampled_r.shape[0]):
-        #         assert is_strictly_increasing(sampled_r[b])
+
 
 
 if __name__ == "__main__": 
-    # test_prioritised_sample_doesnt_sample_prev_broken_trajectories(13,1,13,2,16)
-    test_prioritised_sample_doesnt_sample_prev_broken_trajectories(3,1,4,2,12)
-    # test_prioritised_sample_doesnt_sample_prev_broken_trajectories(3,1,5,2,8)
+    # TEST CASE 1
+    test_case_1_valid = {
+    0: [0],
+    1: [5,6],
+    2: [4,5],
+    3: [2,3],
+    4: [1,2],}
+    test_case_1_invalid = {
+    0: [],
+    1: [0],
+    2: [5,6],
+    3: [4,5],
+    4: [2,3],}
+    
+    # TEST CASE 2
+    test_case_2_valid = {
+    0: [],
+    1: [0, 1],
+    2: [2],
+    3: [3, 4],
+    4: [5],
+}
+    test_case_2_invalid = {
+    0: [],
+    1: [],
+    2: [],
+    3: [],
+    4: [0, 1],
+}
+    # TEST CASE 3
+    test_case_3_valid = {
+    0: [] ,                    
+    1: [0] ,                
+    2: [1, 2],  
+    3: [3],     
+    4: [0, 1]  
+}
+    test_case_3_invalid = {
+    0: [] ,                    
+    1: [] ,                
+    2: [0],  
+    3: [1],     
+    4: [2,3]}
+    
+    # test_prioritised_sample_doesnt_sample_prev_broken_trajectories(13,1,13,2,16, test_case_1_valid, test_case_1_invalid)
+    
+    # test_prioritised_sample_doesnt_sample_prev_broken_trajectories(3,1,4,2,12, test_case_2_valid, test_case_2_invalid)
+    
+    test_prioritised_sample_doesnt_sample_prev_broken_trajectories(3,1,5,2,8, test_case_3_valid, test_case_3_invalid)
     
     # test_prioritised_sample_doesnt_sample_prev_broken_trajectories(64,1,32,2,1000)

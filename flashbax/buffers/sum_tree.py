@@ -256,9 +256,6 @@ def set_non_batched(
         value: The value which we assign to the node. This value must be
             nonnegative. Setting value = 0 will cause the element to never be sampled.
 
-    This is not used in practice within the prioritised replay, as it is not vmap-able. However,
-    it is useful for comparisons and testing. See `set_single` and `set_batch` for the functions
-    that we use within the prioritised replay in practice.
     """
     # We get the tree index of the node.
     mapped_index = get_tree_index(state.tree_depth, node_index)
@@ -272,7 +269,7 @@ def set_non_batched(
         nodes, node_index, delta_value, tree_depth = carry
         depth_level = tree_depth - idx
         mapped_index = get_tree_index(depth_level, node_index)
-        nodes = nodes.at[mapped_index].add(delta_value)
+        nodes = nodes.at[mapped_index].add(delta_value, mode="drop")
         node_index //= 2
 
         return (nodes, node_index, delta_value, tree_depth)
@@ -322,7 +319,7 @@ def set_batch_bincount(
     # This is because we want to set the value of the leaf nodes to the 'latest' value
     # in the batch of values and we do not want to add the delta values of all duplicate
     # nodes.
-    new_nodes = state.nodes.at[mapped_indices].set(values)
+    new_nodes = state.nodes.at[mapped_indices].set(values, mode="drop")
     # We calculate the delta values for each node using the original values.
     # We do it like this to deal with duplicates as we want each delta
     # value for duplicates to be identical.
@@ -348,7 +345,7 @@ def set_batch_bincount(
         nodes, node_indices, delta_values, tree_depth = carry
         depth_level = tree_depth - i
         mapped_indices = get_tree_index(depth_level, node_indices)
-        nodes = nodes.at[mapped_indices].add(delta_values)
+        nodes = nodes.at[mapped_indices].add(delta_values, mode="drop")
         node_indices //= 2
 
         return (nodes, node_indices, delta_values, tree_depth)
@@ -402,3 +399,4 @@ def set_batch_scan(
     state, _ = jax.lax.scan(update_node_priority, state, (node_indices, values))
 
     return state
+
