@@ -259,8 +259,11 @@ def set_non_batched(
     """
     # We get the tree index of the node.
     mapped_index = get_tree_index(state.tree_depth, node_index)
+    # We ensure that if we index out of bounds (which is what we do for padding)
+    # then the node value is zero.
+    node_value = state.nodes.at[mapped_index].get(mode="drop", fill_value=0)
     # We get the delta value for the node.
-    delta_value = value - state.nodes[mapped_index]
+    delta_value = value - node_value
 
     def update_nodes(
         idx: Array, carry: Tuple[Array, Array, Array, Array]
@@ -323,11 +326,13 @@ def set_batch_bincount(
     # We calculate the delta values for each node using the original values.
     # We do it like this to deal with duplicates as we want each delta
     # value for duplicates to be identical.
-    delta_values = new_nodes[mapped_indices] - state.nodes[mapped_indices]
+    new_node_values = new_nodes.at[mapped_indices].get(mode="drop", fill_value=0)
+    orig_node_values = state.nodes.at[mapped_indices].get(mode="drop", fill_value=0)
+    delta_values = new_node_values - orig_node_values
     # Determine the counts of the duplicate indices
     index_counts = jnp.bincount(node_indices, length=state.capacity)
     # We get the number of duplicates for each leaf node being updated.
-    divisor = index_counts[node_indices]
+    divisor = index_counts.at[node_indices].get(mode="drop", fill_value=1)
     # We then divide the delta values by the number of duplicates
     # since they are added together in the tree propagation
     # e.g. if two duplicate leafs are being updated - since their delta values are
@@ -399,4 +404,3 @@ def set_batch_scan(
     state, _ = jax.lax.scan(update_node_priority, state, (node_indices, values))
 
     return state
-
